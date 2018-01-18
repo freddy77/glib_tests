@@ -107,6 +107,67 @@ test_attach_not_owned (void)
   g_source_remove (timeout_id);
 }
 
+/* this test case came from comment 25 on
+ * https://bugzilla.gnome.org/show_bug.cgi?id=761102
+ *
+ *    thread A                 thread B
+ *  ------------             ------------
+ *  for (;;) {
+ *    acquire
+ *    prepare
+ *    query
+ *                           g_source_attach
+ *    release
+ *    ppoll()
+ *    acquire
+ *    check
+ *    dispatch
+ *    release
+ *  }
+ */
+static gpointer
+attach_source (gpointer data)
+{
+  guint id = g_timeout_add (50, never_reached, NULL);
+
+  return GUINT_TO_POINTER (id);
+}
+
+static void
+test_attach_owned (void)
+{
+  gint priority, timeout, n_fds;
+  GPollFD fds[64];
+
+  GMainContext *context = g_main_context_default ();
+
+  guint timeout_id = g_timeout_add (3 * 1000, never_reached, NULL);
+
+  g_main_context_acquire (context);
+  g_main_context_prepare (context, &priority);
+  n_fds = g_main_context_query (context, priority, &timeout, fds, G_N_ELEMENTS(fds));
+  // we should have not pending events here
+  g_assert_cmpint (g_poll (fds, n_fds, 0), ==, 0);
+  GThread *th = g_thread_new (NULL, attach_source, NULL);
+  guint source_id = GPOINTER_TO_UINT (g_thread_join (th));
+  g_main_context_release (context);
+
+  g_assert_cmpint (timeout, >=, 2000);
+
+  // the poll should be woke up by the attach but the attached event
+  // should not be ready at the end (unless the wake came from some
+  // timeout)
+  g_poll (fds, n_fds, timeout);
+
+  g_main_context_acquire (context);
+  g_main_context_check (context, priority, fds, n_fds);
+  g_main_context_dispatch (context);
+  g_main_context_release (context);
+
+  g_source_remove (source_id);
+  g_source_remove (timeout_id);
+}
+
 int
 main (int argc, char *argv[])
 {
@@ -114,6 +175,7 @@ main (int argc, char *argv[])
 
   g_test_add_func ("/mainloop/timedateex", test_timedateex);
   g_test_add_func ("/mainloop/attach_not_owned", test_attach_not_owned);
+  g_test_add_func ("/mainloop/attach_owned", test_attach_owned);
 
   return g_test_run ();
 }
